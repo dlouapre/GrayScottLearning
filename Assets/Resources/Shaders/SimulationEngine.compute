@@ -1,0 +1,688 @@
+﻿#pragma kernel CSInit
+#pragma kernel CSMain
+#pragma kernel CSDump1
+#pragma kernel CSDump2
+
+#define PI 3.141592653
+
+// The struct holding the variables living at each point
+struct Point
+{
+    float T;
+	float rho;
+	float2 v;
+    float A1;
+    float B1;
+    float chem;
+//    float A2;
+//    float B2;
+    float Tox;    
+    float Ant;
+    float Sti;
+//    float Pre;
+    float STM_S;
+//    float STM_P;
+    float LTM;
+};
+
+// Global constants, set at the script level 
+cbuffer GLOB {
+
+    // Global parameters
+
+    float time;
+    //float time_since_last_Ctl_bolus;
+    float time_since_last_Sti_bolus;
+
+    bool simu_T;
+    bool simu_v;
+    bool simu_GS_transport;
+    bool simu_GS_reactions;
+    int memory_mechanism;  // 0 for none, 1 for (Si => L), 2 for (Si + T => L)
+    //bool toxin_production;
+
+    // Interactivity
+
+    bool inputMouse;
+    int mouse_i;
+    int mouse_j;
+    bool remove;
+    int inputTexture;
+    int inputSizeAdd;
+    int inputSizeRemove;
+
+    // Space-time grid
+
+	int RESX;				
+	int RESY;
+
+	float dt;
+	float dx;    
+
+    bool perX;
+    bool perY;
+
+    // Thermal
+
+	float T0;
+	float DeltaT;
+    float LAMBDA;
+    float Cv;
+    float H;
+    float OmegaT;
+    float AmpliT;
+
+
+    // Fluid
+
+	float RHO0;
+	float Rs;
+	float G;
+	float mu;
+
+
+    // Gray-Scott
+    
+    float CHI_A;
+    float CHI_B;
+    float GS_F;
+    float GS_R;
+    float Ea;
+    float k0;
+    float DeltaH1;
+    float DeltaH2;
+
+
+    // Learning
+    bool Bolus_AtBoundaries;
+    bool Bolus_AllBoundaries;  
+    float Bolus_quiet_time;
+    float Bolus_period;
+    float Bolus_concentration;
+    float Bolus_duration;
+    float Bolus_delta;
+    float Bolus_shift;
+
+    float CHI_Sti;
+    //float CHI_Pre;
+    float Sti_decay;
+
+    float Bolus_advection_x;
+
+    float CHI_Tox;
+    float Tox_decay;
+    float CHI_Ant;
+    float Ant_decay;
+
+    float CHI_STM;
+    float STM_decay;
+    float CHI_LTM;
+    float LTM_decay;
+
+    //float kP;
+    float kT;
+    float k_ToxB;
+    float k_AntB;
+
+    float kS;
+    float kL;
+    float kR;
+    float kD;
+    float kO;
+    float kA;
+};
+
+// 2 buffers for holding the data : one for source and one for destination, so we do synchronous calculations
+RWStructuredBuffer<Point> src;
+RWStructuredBuffer<Point> dest;
+
+// The actual texture that we will create from the data
+RWTexture2D<float4> Result_T;
+RWTexture2D<float4> Result_rho;
+RWTexture2D<float4> Result_v;
+RWTexture2D<float4> Result_GS1;
+RWTexture2D<float4> Result_GS2;
+RWTexture2D<float4> Result_Tox;
+RWTexture2D<float4> Result_Ant;
+RWTexture2D<float4> Result_Sti;
+RWTexture2D<float4> Result_Pre;
+RWTexture2D<float4> Result_STM_S;
+RWTexture2D<float4> Result_STM_P;
+RWTexture2D<float4> Result_LTM;
+
+
+#include "ShaderAux.hlsl"
+#include "ThermalFluid.hlsl"
+//#include "DynamicPerlin.hlsl"
+
+// *******************************************************************************************************************
+
+
+float Advection(float2 v, float C, float Cmx, float Cpx, float Cmy, float Cpy)
+{
+    float adv = 0;
+    if (v.x > 0) adv += v.x * (C - Cmx) / dx;
+    else adv += v.x * (Cpx - C) / dx;
+    if (v.y > 0) adv += v.y * (C - Cmy) / dx;
+    else adv += v.y * (Cpy - C) / dx;
+    return adv;
+}
+
+void UpdateGS(uint3 id)
+{                
+    float T = src[xy(id)].T;
+    float2 v = src[xy(id)].v;
+
+    float A1 = src[xy(id)].A1;
+    float B1 = src[xy(id)].B1;
+    //float A2 = src[xy(id)].A2;
+    //float B2 = src[xy(id)].B2;
+    float Tox = src[xy(id)].Tox;
+    float Ant = src[xy(id)].Ant;
+    float Sti = src[xy(id)].Sti;
+    //float Pre = src[xy(id)].Pre;
+    float STM_S = src[xy(id)].STM_S;
+    //float STM_P = src[xy(id)].STM_P;
+    float LTM = src[xy(id)].LTM;
+
+    float dA1_dt = 0;
+    float dB1_dt = 0;
+//    float dA2_dt = 0;
+//    float dB2_dt = 0;
+    float dTox_dt = 0;
+    float dAnt_dt = 0;
+    float dSti_dt = 0;
+//    float dPre_dt = 0;
+    float dSTM_S_dt = 0;
+//    float dSTM_P_dt = 0;
+    float dLTM_dt = 0;
+
+    float chemicalPower = 0;
+
+    if(simu_GS_transport)
+    {
+        float A1_mx = src[mx(id)].A1;
+        float A1_px = src[px(id)].A1;
+        float A1_my = src[my(id)].A1;
+        float A1_py = src[py(id)].A1;
+        float lap_A1 = (A1_px + A1_mx + A1_py + A1_my - 4 * A1) / (dx * dx);        
+        float advA1 = Advection(v, A1, A1_mx, A1_px, A1_my, A1_py);
+        dA1_dt += - advA1 + CHI_A * lap_A1;
+
+        float B1_mx = src[mx(id)].B1;
+        float B1_px = src[px(id)].B1;
+        float B1_my = src[my(id)].B1;
+        float B1_py = src[py(id)].B1;
+        float lap_B1 = (B1_px + B1_mx + B1_py + B1_my - 4 * B1) / (dx * dx);  
+        float advB1 = Advection(v, B1, B1_mx, B1_px, B1_my, B1_py);
+        dB1_dt += - advB1 + CHI_B * lap_B1;
+
+/*
+        float A2_mx = src[mx(id)].A2;
+        float A2_px = src[px(id)].A2;
+        float A2_my = src[my(id)].A2;
+        float A2_py = src[py(id)].A2;   
+        float lap_A2 = (A2_px + A2_mx + A2_py + A2_my - 4 * A2) / (dx * dx);
+        float advA2 = Advection(v, A2, A2_mx, A2_px, A2_my, A2_py);  
+        dA2_dt += - advA2 + CHI_A * lap_A2;         
+
+
+        float B2_mx = src[mx(id)].B2;
+        float B2_px = src[px(id)].B2;
+        float B2_my = src[my(id)].B2;
+        float B2_py = src[py(id)].B2;    
+        float lap_B2 = (B2_px + B2_mx + B2_py + B2_my - 4 * B2) / (dx * dx);
+        float advB2 = Advection(v, B2, B2_mx, B2_px, B2_my, B2_py);
+        dB2_dt += - advB2 + CHI_B * lap_B2;
+*/
+
+        float Sti_mx = src[mx(id)].Sti;
+        float Sti_px = src[px(id)].Sti;
+        float Sti_my = src[my(id)].Sti;
+        float Sti_py = src[py(id)].Sti;    
+        float lap_Sti = (Sti_px + Sti_mx + Sti_py + Sti_my - 4 * Sti) / (dx * dx);
+        float advSti = Advection(v + float2(Bolus_advection_x,0), Sti, Sti_mx, Sti_px, Sti_my, Sti_py);
+        dSti_dt += - advSti + CHI_Sti * lap_Sti;
+/*
+        float Pre_mx = src[mx(id)].Pre;
+        float Pre_px = src[px(id)].Pre;
+        float Pre_my = src[my(id)].Pre;
+        float Pre_py = src[py(id)].Pre;    
+        float lap_Pre = (Pre_px + Pre_mx + Pre_py + Pre_my - 4 * Pre) / (dx * dx);
+        float advPre = Advection(v + float2(Bolus_advection_x,0), Pre, Pre_mx, Pre_px, Pre_my, Pre_py);
+        dPre_dt += - advPre + CHI_Pre * lap_Pre;
+*/
+
+        float Tox_mx = src[mx(id)].Tox;
+        float Tox_px = src[px(id)].Tox;
+        float Tox_my = src[my(id)].Tox;
+        float Tox_py = src[py(id)].Tox;    
+        float lap_Tox = (Tox_px + Tox_mx + Tox_py + Tox_my - 4 * Tox) / (dx * dx);
+        float advTox = Advection(v + float2(Bolus_advection_x,0), Tox, Tox_mx, Tox_px, Tox_my, Tox_py);
+        dTox_dt += - advTox + CHI_Tox * lap_Tox;
+
+        float Ant_mx = src[mx(id)].Ant;
+        float Ant_px = src[px(id)].Ant;
+        float Ant_my = src[my(id)].Ant;
+        float Ant_py = src[py(id)].Ant;    
+        float lap_Ant = (Ant_px + Ant_mx + Ant_py + Ant_my - 4 * Ant) / (dx * dx);
+        float advAnt = Advection(v, Ant, Ant_mx, Ant_px, Ant_my, Ant_py);
+        dAnt_dt += - advAnt + CHI_Ant * lap_Ant;
+
+        float STM_S_mx = src[mx(id)].STM_S;
+        float STM_S_px = src[px(id)].STM_S;
+        float STM_S_my = src[my(id)].STM_S;
+        float STM_S_py = src[py(id)].STM_S;    
+        float lap_STM_S = (STM_S_px + STM_S_mx + STM_S_py + STM_S_my - 4 * STM_S) / (dx * dx);
+        float advSTM_S = Advection(v, STM_S, STM_S_mx, STM_S_px, STM_S_my, STM_S_py);
+        dSTM_S_dt += - advSTM_S + CHI_STM * lap_STM_S;
+
+/*
+        float STM_P_mx = src[mx(id)].STM_P;
+        float STM_P_px = src[px(id)].STM_P;
+        float STM_P_my = src[my(id)].STM_P;
+        float STM_P_py = src[py(id)].STM_P;    
+        float lap_STM_P = (STM_P_px + STM_P_mx + STM_P_py + STM_P_my - 4 * STM_P) / (dx * dx);
+        float advSTM_P = Advection(v, STM_P, STM_P_mx, STM_P_px, STM_P_my, STM_P_py);
+        dSTM_P_dt += - advSTM_P + CHI_STM * lap_STM_P;
+*/
+
+        float LTM_mx = src[mx(id)].LTM;
+        float LTM_px = src[px(id)].LTM;
+        float LTM_my = src[my(id)].LTM;
+        float LTM_py = src[py(id)].LTM;    
+        float lap_LTM = (LTM_px + LTM_mx + LTM_py + LTM_my - 4 * LTM) / (dx * dx);
+        float advLTM = Advection(v, LTM, LTM_mx, LTM_px, LTM_my, LTM_py);
+        dLTM_dt += - advLTM + CHI_LTM * lap_LTM;     
+    }
+    
+    if(simu_GS_reactions)
+    {
+        // -----
+        // Decay
+        // -----
+        // Effective supply and removal
+        float GS_F_eff = GS_F;
+        float GS_R_eff = GS_R;
+        // // Adjust GS supply and depletion to generate a phase diagram
+        // GS_F_eff = 0.02 + 0.04 * (1.0 * id.x / RESX);
+        // GS_R_eff = 0.05 + 0.02 * (1.0 * id.y / RESY);
+
+
+        float A_FEED = 1;
+        dA1_dt += GS_F_eff * (A_FEED - A1);          // INFEED FOR A
+        dB1_dt += - (GS_F_eff + GS_R_eff) * B1;
+        
+        dSti_dt += - Sti_decay * Sti;   // note : no decay for Pre since it decays into Tox        
+        dTox_dt += - Tox_decay * Tox;
+        dSTM_S_dt += - STM_decay * STM_S;
+        //dSTM_P_dt += - STM_decay * STM_P;
+        dLTM_dt += - LTM_decay * LTM;
+        dAnt_dt += - Ant_decay * Ant;
+        
+        // -----------
+        // GS Reactions
+        // -----------        
+        float k = k0 * exp(- Ea / T);  // Arrhenius
+        float rate_GS1 = k * A1 * B1 * B1;
+        dA1_dt += - rate_GS1;
+        dB1_dt += rate_GS1;
+        chemicalPower += rate_GS1 * DeltaH1;
+
+        /*
+        float rate_GS2 = k * A2 * B2 * B2;
+        dA2_dt += GS_F_eff * (1 - A2) - rate_GS2;
+        dB2_dt += - (GS_F_eff + GS_R_eff) * B2 + rate_GS2;
+        chemicalPower += rate_GS2 * DeltaH2;
+        */
+
+
+
+        /* TOXIN PRODUCTION FROM PRECURSOR
+        if(toxin_production)
+        {
+            dPre_dt += kP * Sti;
+        }
+        dTox_dt += kT * Pre;
+        dPre_dt -= kT * Pre;
+        */
+
+        // Toxin reacts with B1 
+        dB1_dt -= k_ToxB * Tox * B1;
+        dTox_dt -= k_ToxB * Tox * B1; 
+
+
+        // ================
+        // Network Antidote
+        // ================
+
+        if(memory_mechanism == 1)
+        {
+            dAnt_dt += kR * Tox * B1;
+        }
+        
+        if(memory_mechanism == 2)
+        {
+            dAnt_dt += kD * Sti * B1;
+        }
+
+
+        if(memory_mechanism == 3)
+        {
+            // STM production catalyzed by stimulus in the presence of B
+            dSTM_S_dt += kS * Sti * B1;
+            
+            dLTM_dt += kL * Tox * STM_S;
+            dSTM_S_dt -= kL * Tox * STM_S;
+
+            // Antidote production catalyzed by Sti and LTM
+            dAnt_dt += kO * LTM * Sti * B1;
+        }
+
+        // Optional cap on the antidote production rate
+        // float MAX_ANT_RATE = 0.02;
+        // dAnt_dt = min(dAnt_dt, MAX_ANT_RATE);
+
+        // Antidote reacts with Toxin
+        dTox_dt -= kA * Ant * Tox;
+        dAnt_dt -= kA * Ant * Tox;
+
+        // Antidote detrimental to B
+        dB1_dt -= k_AntB * Ant * B1 ;
+        dAnt_dt -= k_AntB * Ant * B1 ;
+    }
+
+    dest[xy(id)].A1 = max(0, A1 + dt * dA1_dt);
+    dest[xy(id)].B1 = max(0, B1 + dt * dB1_dt);
+
+//    dest[xy(id)].A2 = max(0, A2 + dt * dA2_dt);
+//    dest[xy(id)].B2 = max(0, B2 + dt * dB2_dt);
+
+    dest[xy(id)].Tox = max(0, Tox + dt * dTox_dt);
+    
+    dest[xy(id)].Ant = max(0, Ant + dt * dAnt_dt);
+    dest[xy(id)].Sti = max(0, Sti + dt * dSti_dt);
+//    dest[xy(id)].Pre = max(0, Pre + dt * dPre_dt);
+    dest[xy(id)].STM_S = max(0, STM_S + dt * dSTM_S_dt);
+//    dest[xy(id)].STM_P = max(0, STM_P + dt * dSTM_P_dt);
+
+    dest[xy(id)].LTM = max(0, LTM + dt * dLTM_dt);
+
+    dest[xy(id)].chem = chemicalPower;
+
+    // =======
+    // BOLUSES
+    // =======
+
+    if(time > Bolus_quiet_time)
+    {
+/*
+        if(fmod(time,Bolus_period) < Bolus_duration)
+        {
+            if(Bolus_AtBoundaries)
+            {
+                if(Bolus_AllBoundaries)
+                {
+                    if(id.x == 0 || id.x == RESX - 1 || id.y == 0 || id.y == RESY - 1)
+                    {
+                        dest[xy(id)].Ctl = Bolus_concentration;
+                    }
+                }
+                else
+                {
+                    if(id.x == 1) // 1 instead of 0 to avoid advection problem with upwind scheme
+                    {
+                        dest[xy(id)].Ctl = Bolus_concentration;
+                    }
+                }
+
+            }
+            else
+            {
+                dest[xy(id)].Ctl = Bolus_concentration;
+            }
+        }
+*/
+
+        if(fmod(time, Bolus_period) < Bolus_duration)        
+        {
+            if(Bolus_AtBoundaries)
+            {
+                if(Bolus_AllBoundaries)
+                {
+                    if(id.x == 0 || id.x == RESX - 1 || id.y == 0 || id.y == RESY - 1)
+                    {
+                        dest[xy(id)].Sti = Bolus_concentration;
+                    }
+                }
+                else
+                {
+                    if(id.x == 1) // 1 instead of 0 to avoid advection problem with upwind scheme
+                    {
+                        dest[xy(id)].Sti = Bolus_concentration;
+                    }
+                }
+            }
+            else
+            {
+                dest[xy(id)].Sti = Bolus_concentration;
+            }
+        }
+
+
+        float kT_eff = 0;
+        if((time-Bolus_quiet_time) < Bolus_shift)
+        {
+            kT_eff = kT * ((time-Bolus_quiet_time)/Bolus_shift);
+        }
+        else if ((time-Bolus_quiet_time) < 2 * Bolus_shift)
+        {
+            kT_eff = kT * (2 - (time-Bolus_quiet_time)/Bolus_shift);
+        }
+
+
+
+        if(fmod(time - Bolus_delta, Bolus_period) < Bolus_duration)        
+        {
+            if(Bolus_AtBoundaries)
+            {
+                if(Bolus_AllBoundaries)
+                {
+                    if(id.x == 0 || id.x == RESX - 1 || id.y == 0 || id.y == RESY - 1)
+                    {
+                        dest[xy(id)].Tox = kT_eff * Bolus_concentration;
+                    }
+                }
+                else
+                {
+                    if(id.x == 1) // 1 instead of 0 to avoid advection problem with upwind scheme
+                    {
+                        dest[xy(id)].Tox = kT_eff * Bolus_concentration;
+                    }
+                }
+            }
+            else
+            {
+                dest[xy(id)].Tox = kT_eff * Bolus_concentration;
+            }
+        }
+
+
+
+
+
+
+    }
+
+
+
+    // No B on the boundary 
+    if(id.x == 0 || id.x == RESX - 1 || id.y == 0 || id.y == RESY - 1)
+    {
+        dest[xy(id)].B1 = 0;
+    }
+        
+
+}
+
+
+void ApplyMouseInput(uint3 id)
+{       
+    float HeatRate = 0.01;
+    int idx = id.x;
+    int idy = id.y;
+
+    if(remove == false && idx>mouse_i-inputSizeAdd && idx<mouse_i+inputSizeAdd && idy>mouse_j - inputSizeAdd && idy<mouse_j + inputSizeAdd)
+    {
+        if(inputTexture == 0) dest[xy(id)].T += HeatRate * dt;
+        if(inputTexture == 3) dest[xy(id)].B1 = 1;
+
+        //if(inputTexture == 4) dest[xy(id)].B2 = 1;
+
+        if(inputTexture == 5) dest[xy(id)].Tox = 1;
+        if(inputTexture == 6) dest[xy(id)].Ant = 10;
+        if(inputTexture == 7) dest[xy(id)].Sti = 1;
+
+        //if(inputTexture == 8) dest[xy(id)].Pre = 1;
+
+        if(inputTexture == 9) dest[xy(id)].STM_S = 1;
+
+        //if(inputTexture == 10) dest[xy(id)].STM_P = 1;
+
+        if(inputTexture == 11) dest[xy(id)].LTM = 1;
+    }
+
+    if(remove == true && idx > mouse_i - inputSizeRemove && idx < mouse_i + inputSizeRemove && idy > mouse_j - inputSizeRemove && idy < mouse_j + inputSizeRemove)
+    {
+        if(inputTexture == 0) dest[xy(id)].T -= HeatRate * dt;
+        if(inputTexture == 3) dest[xy(id)].B1 = 0;
+        //if(inputTexture == 4) dest[xy(id)].B2 = 0;
+        if(inputTexture == 5) dest[xy(id)].Tox = 0;
+        if(inputTexture == 6) dest[xy(id)].Ant = 0;
+        if(inputTexture == 7) dest[xy(id)].Sti = 0;
+        //if(inputTexture == 8) dest[xy(id)].Pre = 0;
+        if(inputTexture == 9) dest[xy(id)].STM_S = 0;
+        //if(inputTexture == 10) dest[xy(id)].STM_P = 0;
+
+        if(inputTexture == 11) dest[xy(id)].LTM = 0;
+    }
+}
+
+
+// *******************************************************************************************************************
+
+[numthreads(32, 32, 1)]
+void CSInit(uint3 id : SV_DispatchThreadID)
+{    
+    if (simu_v)
+        InitiateRho(id);
+        		
+    dest[xy(id)] = src[xy(id)];
+
+    // useful ???:
+    //time_since_last_Ctl_bolus = 0;
+
+    time_since_last_Sti_bolus = Bolus_delta;
+}
+
+
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{   
+
+    UpdateGS(id);
+        
+    if (simu_T)
+        UpdateTemperature(id);
+    
+    if (simu_v)
+    {
+        UpdateRho(id);
+        UpdateVelocity(id);
+    }               
+
+    if(inputMouse) ApplyMouseInput(id);    
+}
+
+
+float4 colorInferno(float v, float VMIN, float VMAX)
+{
+    float4 c0 = (1 / 255.0) * float4(0, 0, 4, 255);
+    float4 c1 = (1 / 255.0) * float4(22, 11, 57, 255);
+    float4 c2 = (1 / 255.0) * float4(66, 10, 104, 255);
+    float4 c3 = (1 / 255.0) * float4(106, 23, 110, 255);
+    float4 c4 = (1 / 255.0) * float4(147, 38, 103, 255);
+    float4 c5 = (1 / 255.0) * float4(186, 54, 85, 255);
+    float4 c6 = (1 / 255.0) * float4(221, 81, 58, 255);
+    float4 c7 = (1 / 255.0) * float4(243, 118, 27, 255);
+    float4 c8 = (1 / 255.0) * float4(252, 165, 10, 255);
+    float4 c9 = (1 / 255.0) * float4(246, 215, 70, 255);
+    float4 c10 = (1 / 255.0) * float4(246, 215, 70, 255);
+    
+    float x = min(0.999, (v - VMIN) / (VMAX - VMIN));
+    float y = (10 * x) % 1;
+
+    if (x < 0.1)               
+        return (1 - y) * c0 + y * c1;
+    if (x < 0.2)               
+        return (1 - y) * c1 + y * c2;
+    if (x < 0.3)               
+        return (1 - y) * c2 + y * c3;
+    if (x < 0.4)               
+        return (1 - y) * c3 + y * c4;
+    if (x < 0.5)               
+        return (1 - y) * c4 + y * c5;
+    if (x < 0.6)               
+        return (1 - y) * c5 + y * c6;
+    if (x < 0.7)               
+        return (1 - y) * c6 + y * c7;
+    if (x < 0.8)               
+        return (1 - y) * c7 + y * c8;
+    if (x < 0.9)               
+        return (1 - y) * c8 + y * c9;
+                   
+    return (1 - y) * c9 + y * c10;
+    
+}
+
+
+[numthreads(32, 32, 1)]
+void CSDump1(uint3 id : SV_DispatchThreadID)
+{
+    float TMIN = 1; // T0 - 0.5 * DeltaT
+    float TMAX = 2; // T0 + 0.5 * DeltaT
+    Result_T[id.xy] = color2Lerp(dest[xy(id)].T, TMIN, TMAX, float4(0, 0, 1, 1), float4(1, 1, 1, 1), float4(1, 0, 0, 1));
+
+    Result_rho[id.xy] = colorLerp(dest[xy(id)].rho, 0.5, 1.5, float4(1, 1, 1, 1), float4(0, 0, 0, 1));
+
+    Result_v[id.xy] = colorHueSat(dest[xy(id)].v, 1, float4(1, 1, 1, 1));
+    
+    Result_GS1[id.xy] = colorInferno(dest[xy(id)].B1 - dest[xy(id)].A1, -1, 0);
+
+    // // Thresholding
+    // // For A_FEED = 1, and *2 in diffusion constant between A and B, at the center of the spots B is maxB= 0.38 & A is minA=0.26
+    // Result_GS1[id.xy] = float4(0,0,0,1);
+    // if(dest[xy(id)].B1 - dest[xy(id)].A1 > -0.25)
+    // {
+    //     Result_GS1[id.xy] = float4(1,1,1,1);
+    // }
+    
+    //Result_GS2[id.xy] = colorInferno(dest[xy(id)].B2 - dest[xy(id)].A2, -1, 0);
+
+    Result_Tox[id.xy] = colorLerp(dest[xy(id)].Tox, 0, 1, float4(1, 1, 1, 1), float4(1, 0, 0, 1));
+    Result_Ant[id.xy] = colorLerp(pow(dest[xy(id)].Ant,0.5), 0, 1, float4(1, 1, 1, 1), float4(0, 0.6, 0, 1));
+}
+
+[numthreads(32, 32, 1)]
+void CSDump2(uint3 id : SV_DispatchThreadID)
+{
+    Result_Sti[id.xy] = colorLerp(dest[xy(id)].Sti, 0, 1, float4(1, 1, 1, 1), float4(1, 0.5, 0, 1));
+    //Result_Pre[id.xy] = colorLerp(dest[xy(id)].Pre, 0, 1.5, float4(1, 1, 1, 1), float4(1, 1, 0, 1));
+    Result_STM_S[id.xy] = colorLerp(dest[xy(id)].STM_S, 0, 1, float4(1, 1, 1, 1), float4(0, 1, 1, 1));
+    //Result_STM_S[id.xy] = colorInferno(dest[xy(id)].STM_S, 0, 1);
+
+    //Result_STM_P[id.xy] = colorLerp(dest[xy(id)].STM_P, 0, 1, float4(1, 1, 1, 1), float4(0.7, 1, 1, 1));
+
+    Result_LTM[id.xy] = colorLerp(dest[xy(id)].LTM, 0, 1, float4(1, 1, 1, 1), float4(0, 0, 1, 1));
+}
