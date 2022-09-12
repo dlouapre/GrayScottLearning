@@ -1,0 +1,316 @@
+﻿#pragma kernel CSInit
+#pragma kernel CSMain
+#pragma kernel CSDump1
+#pragma kernel CSDump2
+
+#define PI 3.141592653
+
+// Below are flags to chose the desired simulation features. They should be identical in SimulationEngine.compute and SimulationManager.cs
+#define FLOW
+#define HEAT
+#define GS2
+#define LEARNING
+
+
+// The struct holding the variables in each cell
+struct Point
+{
+    float A1;
+    float B1;
+
+
+#ifdef LEARNING    
+    float Sti;
+    float Tox; 
+    float Ant;
+    float STM_S;
+    float LTM;
+#endif
+
+#ifdef HEAT
+    float T;
+    float chem;
+#endif
+
+#ifdef FLOW
+	float rho;
+	float2 v;
+#endif
+
+#ifdef GS2
+   float A2;
+   float B2;
+#endif   
+
+};
+
+
+// GLOBAL CONSTANTS, set at the script level 
+cbuffer GLOB {
+
+    // Global parameters
+    float time;    
+    float time_since_last_Sti_bolus;
+
+    bool simu_T;                // whether to simulate heat transfer
+    bool simu_v;                // whether to simulate fluid flow
+    bool simu_heritable;        // whether to simulate heritability mechanism
+    int memory_mechanism;       // 0 for none, 1 for reactive (Tox => Ant), 2 for preemptive (Sti => Ant), 3 for associative learning with STM, LTM
+    
+    // Interactivity
+    bool inputMouse;            // is there a mouse input
+    int mouse_i;                // input coordinates
+    int mouse_j;
+    bool remove;                // add or remove ?
+    int inputTexture;           // id of the texture to be affected
+    int inputSize;              // spatial size of the "input" mouse action
+    float inputStrength;        // relative strength
+
+    // Space-time grid
+	uint RESX;				
+	uint RESY;
+	float dt;
+	float dx;    
+    bool perX;
+    bool perY;
+
+    // Thermal
+	float T0;                   // Base temperature
+	float DeltaT;               // Amplitude of gradient set at the boundary
+    float LAMBDA;               // Thermal conductivity
+    float Cv;                   // Heat capacity
+    float BOUNDARY_HEAT_TRANSFER_COEFFICIENT;
+    float OmegaT;               // Pulsation of temperature oscillations at the boundary
+    float AmpliT;               // Amplitude
+
+    // Fluid
+    float VX0;                  // Stationnary velocity
+    float VY0;
+	float RHO0;                 // Base density
+    float Rs;                   // Specific constant so that P = rho Rs T0
+	float G;                    // Gravity
+	float mu;                   // Viscosity
+
+
+    // Gray-Scott
+    float A_diffusion;
+    float B_diffusion;
+    float GS_F;
+    float GS_R;
+    float Ea;
+    float k0;
+    float DeltaH1;
+    float DeltaH2;
+
+
+    // Learning
+    // ========
+    bool Bolus_AtBoundaries;        // whether bolus is at boundaries (or uniformly)
+    float Bolus_quiet_time;         // Time without boluses so that the Gray-Scott system can fully develop
+    float Bolus_period;             // Period between two boluses of the same compound
+    float Bolus_concentration;
+    float Bolus_duration;
+    float Bolus_delta;              // Time interval between bolus of Stimulus and bolus of Toxin
+    float Bolus_shift;              // Time scale for shifting the environment evolution behavior
+
+    // Diffusion constant and decay rate
+    float Sti_diffusion;    
+    float Sti_decay;
+
+    float Tox_diffusion;
+    float Tox_decay;
+
+    float Ant_diffusion;
+    float Ant_decay;
+
+    float STM_diffusion;
+    float STM_decay;
+
+    float LTM_diffusion;
+    float LTM_decay;
+
+    // Reaction constants
+
+    // Toxin and antidote
+    float k_TB;         // T + B => 0
+    float k_NB;         // T + N => 0
+    float k_NT;         // N + T => 0
+
+    // Learning mechanisms
+    float kD;           // Antidote production in direct network
+    float kP;           // Antidote production in preemptive network
+    float kM;           // Short term memory production from Stimulus
+    float kL;           // Long term memory production from M and T
+    float kA;           // Antidote production in associative network
+
+};
+
+// 2 buffers for holding the data : one for source and one for destination, so we do synchronous calculations
+RWStructuredBuffer<Point> src;
+RWStructuredBuffer<Point> dest;
+
+// The actual texture that we will create from the data
+RWTexture2D<float4> Result_T;
+RWTexture2D<float4> Result_rho;
+RWTexture2D<float4> Result_v;
+RWTexture2D<float4> Result_GS1;
+RWTexture2D<float4> Result_GS2;
+RWTexture2D<float4> Result_Tox;
+RWTexture2D<float4> Result_Ant;
+RWTexture2D<float4> Result_Sti;
+RWTexture2D<float4> Result_STM_S;
+RWTexture2D<float4> Result_LTM;
+
+
+#include "ShaderAux.hlsl"
+#include "ChemicalReactions.hlsl"
+#include "ThermalFluid.hlsl"
+
+
+// *******************************************************************************************************************
+
+// *** ApplyMouseInput
+// Add or remove something based on the numerical id of the inputTexture
+// and a certain size of the input (radius)
+void ApplyMouseInput(uint3 id)
+{       
+
+    float HeatRate = 0.01;
+
+    int idx = id.x;
+    int idy = id.y;
+
+    // ADDITION
+    if(remove == false && idx>mouse_i-inputSize && idx<mouse_i+inputSize && idy>mouse_j - inputSize && idy<mouse_j + inputSize)
+    {
+#ifdef HEAT        
+        if(inputTexture == 0) dest[xy(id)].T += inputStrength * HeatRate * dt;
+#endif
+#ifdef FLOW       
+        if(inputTexture == 1) dest[xy(id)].rho = inputStrength * 1.5 * RHO0 ;
+        if(inputTexture == 2) dest[xy(id)].v = inputStrength * float2(1,1);
+#endif
+      
+        if(inputTexture == 3) dest[xy(id)].B1 = inputStrength * 1;
+#ifdef GS2
+        if(inputTexture == 4) dest[xy(id)].B2 = inputStrength * 1;
+#endif
+
+#ifdef LEARNING
+        if(inputTexture == 5) dest[xy(id)].Tox = inputStrength * 1;
+        if(inputTexture == 6) dest[xy(id)].Ant = inputStrength * 1;
+        if(inputTexture == 7) dest[xy(id)].Sti = inputStrength * 1;
+        if(inputTexture == 8) dest[xy(id)].STM_S = inputStrength * 1;
+        if(inputTexture == 9) dest[xy(id)].LTM = inputStrength * 1;
+#endif
+    }
+
+
+    // REMOVAL
+    if(remove == true && idx > mouse_i - inputSize && idx < mouse_i + inputSize && idy > mouse_j - inputSize && idy < mouse_j + inputSize)
+    {
+#ifdef HEAT        
+        if(inputTexture == 0) dest[xy(id)].T = max(0, dest[xy(id)].T - inputStrength * HeatRate * dt);
+#endif
+#ifdef FLOW       
+        if(inputTexture == 1) dest[xy(id)].rho = inputStrength * 0.5 * RHO0 ;
+        if(inputTexture == 2) dest[xy(id)].v = inputStrength * float2(0,0);
+#endif
+      
+        if(inputTexture == 3) dest[xy(id)].B1 = max(0, dest[xy(id)].B1 - inputStrength * 1);
+#ifdef GS2
+        if(inputTexture == 4) dest[xy(id)].B2 = max(0, dest[xy(id)].B2 - inputStrength * 1);
+#endif
+
+#ifdef LEARNING
+        if(inputTexture == 5) dest[xy(id)].Tox = max(0, dest[xy(id)].Tox - inputStrength * 1);
+        if(inputTexture == 6) dest[xy(id)].Ant = max(0, dest[xy(id)].Ant - inputStrength * 1);
+        if(inputTexture == 7) dest[xy(id)].Sti = max(0, dest[xy(id)].Sti - inputStrength * 1);
+        if(inputTexture == 8) dest[xy(id)].STM_S = max(0, dest[xy(id)].STM_S - inputStrength * 1);
+        if(inputTexture == 9) dest[xy(id)].LTM = max(0, dest[xy(id)].LTM - inputStrength * 1);
+#endif
+    }
+}
+
+
+// *******************************************************************************************************************
+
+// =======
+// KERNELS
+// =======
+
+
+// *** Initialization
+[numthreads(32, 32, 1)]
+void CSInit(uint3 id : SV_DispatchThreadID)
+{  
+
+#ifdef FLOW
+     if (simu_v)
+         InitiateRho(id);
+#endif    
+
+    dest[xy(id)] = src[xy(id)];
+    time_since_last_Sti_bolus = Bolus_delta;
+}
+
+
+// *** Main
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{   
+
+    UpdateChemicalReactions(id);
+
+#ifdef HEAT        
+     if (simu_T)
+         UpdateTemperature(id);
+#endif
+
+#ifdef FLOW    
+    if (simu_v){
+        UpdateRho(id);
+        UpdateVelocity(id);
+    }   
+#endif            
+
+
+    if(inputMouse) ApplyMouseInput(id);    
+}
+
+
+// *** DUMP KERNERLS
+// The number of texture that can be set in the same kernel is limited, so we have several dump kernels
+
+[numthreads(32, 32, 1)]
+void CSDump1(uint3 id : SV_DispatchThreadID)
+{
+    Result_GS1[id.xy] = colorInferno(dest[xy(id)].B1 - dest[xy(id)].A1, -1, 0);
+
+#ifdef HEAT
+    float TMIN = 1; // T0 - 0.5 * DeltaT
+    float TMAX = 2; // T0 + 0.5 * DeltaT
+    Result_T[id.xy] = color2Lerp(dest[xy(id)].T, TMIN, TMAX, float4(0, 0, 1, 1), float4(1, 1, 1, 1), float4(1, 0, 0, 1));
+#endif
+#ifdef FLOW
+    Result_rho[id.xy] = colorLerp(dest[xy(id)].rho, 0.5, 1.5, float4(1, 1, 1, 1), float4(0, 0, 0, 1));
+    Result_v[id.xy] = colorHueSat(dest[xy(id)].v, 1, float4(1, 1, 1, 1));
+#endif
+    
+#ifdef GS2    
+    Result_GS2[id.xy] = colorInferno(dest[xy(id)].B2 - dest[xy(id)].A2, -1, 0);
+#endif
+}
+
+
+[numthreads(32, 32, 1)]
+void CSDump2(uint3 id : SV_DispatchThreadID)
+{
+#ifdef LEARNING
+    Result_Tox[id.xy] = colorLerp(dest[xy(id)].Tox, 0, 1, float4(1, 1, 1, 1), float4(1, 0, 0, 1));
+    Result_Ant[id.xy] = colorLerp(pow(dest[xy(id)].Ant,0.5), 0, 1, float4(1, 1, 1, 1), float4(0, 0.6, 0, 1));
+    Result_Sti[id.xy] = colorLerp(dest[xy(id)].Sti, 0, 1, float4(1, 1, 1, 1), float4(1, 0.5, 0, 1));
+    Result_STM_S[id.xy] = colorLerp(dest[xy(id)].STM_S, 0, 1, float4(1, 1, 1, 1), float4(0, 1, 1, 1));
+    Result_LTM[id.xy] = colorLerp(dest[xy(id)].LTM, 0, 1, float4(1, 1, 1, 1), float4(0, 0, 1, 1));
+#endif
+}
